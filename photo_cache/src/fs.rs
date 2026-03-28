@@ -25,9 +25,10 @@ const FINDER_INFO_XATTR: &str = "com.apple.FinderInfo";
 const FINDER_INFO_LEN: usize = 32;
 
 // FinderInfo color label values for byte 9: color << 1 (bits 3:1)
-const FINDER_COLOR_GREEN: u8 = 6 << 1;  // 0x0C
-const FINDER_COLOR_YELLOW: u8 = 3 << 1; // 0x06
-const FINDER_COLOR_ORANGE: u8 = 1 << 1; // 0x02
+// Verified mapping: 1=gray, 2=green, 3=purple, 4=blue, 5=yellow, 6=red, 7=orange
+const FINDER_COLOR_GREEN: u8 = 2 << 1;  // 0x04
+const FINDER_COLOR_YELLOW: u8 = 5 << 1; // 0x0A
+const FINDER_COLOR_ORANGE: u8 = 7 << 1; // 0x0E
 
 fn make_finder_info(color_byte: u8) -> [u8; FINDER_INFO_LEN] {
     let mut info = [0u8; FINDER_INFO_LEN];
@@ -36,9 +37,10 @@ fn make_finder_info(color_byte: u8) -> [u8; FINDER_INFO_LEN] {
 }
 
 
-// Binary plist encoding of ["Green\n6"] — file cached locally
+// Binary plist encoding of ["Green\n2"] — file cached locally
+// Tag color indices: 0=none, 1=gray, 2=green, 3=purple, 4=blue, 5=yellow, 6=red, 7=orange
 const GREEN_TAG_PLIST: &[u8] = &[
-    98, 112, 108, 105, 115, 116, 48, 48, 161, 1, 87, 71, 114, 101, 101, 110, 10, 54,
+    98, 112, 108, 105, 115, 116, 48, 48, 161, 1, 87, 71, 114, 101, 101, 110, 10, 50,
     8, 10, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 18,
 ];
@@ -169,7 +171,8 @@ impl PhotoCacheFS {
         if rel_path.is_empty() || !rel_path.contains('/') {
             return false;
         }
-        self.cache_dir.join(rel_path).exists()
+        let path = self.cache_dir.join(rel_path);
+        path.is_file()
     }
 
     /// Check if a file has a pending write (not yet synced to NAS).
@@ -1207,22 +1210,6 @@ impl Filesystem for PhotoCacheFS {
                 }
                 return;
             }
-
-            if name_str == FINDER_TAGS_XATTR {
-                let plist = if color_byte == FINDER_COLOR_ORANGE {
-                    ORANGE_TAG_PLIST
-                } else {
-                    GREEN_TAG_PLIST
-                };
-                if size == 0 {
-                    reply.size(plist.len() as u32);
-                } else if size >= plist.len() as u32 {
-                    reply.data(plist);
-                } else {
-                    reply.error(Errno::ERANGE);
-                }
-                return;
-            }
         }
 
         reply.error(Errno::from_i32(libc::ENOATTR));
@@ -1241,10 +1228,8 @@ impl Filesystem for PhotoCacheFS {
         };
 
         if self.is_pending_write(&rel_path) || self.is_cached(&rel_path) || self.is_file_cached(&rel_path) {
-            // Report both xattr names (null-terminated each)
+            // Only report FinderInfo xattr
             let mut names = Vec::from(FINDER_INFO_XATTR.as_bytes());
-            names.push(0);
-            names.extend_from_slice(FINDER_TAGS_XATTR.as_bytes());
             names.push(0);
             if size == 0 {
                 reply.size(names.len() as u32);
