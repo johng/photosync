@@ -1,6 +1,5 @@
 mod cache_db;
 mod config;
-#[cfg(feature = "fuse")]
 mod fs;
 mod sync;
 
@@ -46,12 +45,7 @@ fn main() {
         Commands::Status => cmd_status(&config),
         Commands::Sync => cmd_sync(&config),
         Commands::Clear => cmd_clear(&config),
-        Commands::Mount => {
-            #[cfg(feature = "fuse")]
-            cmd_mount(&config);
-            #[cfg(not(feature = "fuse"))]
-            eprintln!("Mount requires the 'fuse' feature. Build with: cargo build --features fuse");
-        }
+        Commands::Mount => cmd_mount(&config),
         Commands::Unmount => cmd_unmount(&config),
         Commands::Init => cmd_init(&config),
     }
@@ -94,7 +88,6 @@ fn cmd_clear(config: &Config) {
     println!("Cache cleared.");
 }
 
-#[cfg(feature = "fuse")]
 fn cmd_mount(config: &Config) {
     std::fs::create_dir_all(&config.cache_dir).ok();
     println!("Mounting at {}...", config.mount_point.display());

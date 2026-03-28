@@ -1,9 +1,10 @@
 // src/fs.rs — FUSE filesystem presenting a unified view of NAS + local cache
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, RenameFlags,
+    Request, TimeOrNow, WriteFlags,
 };
-use libc::{EIO, ENOENT, ENOTEMPTY};
 use log::{error, warn};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -113,7 +114,7 @@ impl PhotoCacheFS {
     }
 
     /// Build FileAttr from filesystem metadata
-    fn make_attr(&self, ino: u64, meta: &std::fs::Metadata) -> FileAttr {
+    fn make_attr(&self, ino: INodeNo, meta: &std::fs::Metadata) -> FileAttr {
         let kind = if meta.is_dir() {
             FileType::Directory
         } else if meta.is_symlink() {
@@ -210,21 +211,21 @@ impl PhotoCacheFS {
 }
 
 impl Filesystem for PhotoCacheFS {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
 
         let parent_rel = {
             let inodes = self.inodes.lock().unwrap();
-            match inodes.get_path(parent) {
+            match inodes.get_path(parent.0) {
                 Some(p) => p.to_string(),
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -235,7 +236,7 @@ impl Filesystem for PhotoCacheFS {
         let resolved = match self.resolve(&child_rel) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -243,23 +244,23 @@ impl Filesystem for PhotoCacheFS {
         let meta = match fs::metadata(&resolved) {
             Ok(m) => m,
             Err(_) => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
 
         let ino = self.inodes.lock().unwrap().get_or_create(&child_rel);
-        let attr = self.make_attr(ino, &meta);
-        reply.entry(&TTL, &attr, 0);
+        let attr = self.make_attr(INodeNo(ino), &meta);
+        reply.entry(&TTL, &attr, Generation(0));
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         let rel_path = {
             let inodes = self.inodes.lock().unwrap();
-            match inodes.get_path(ino) {
+            match inodes.get_path(ino.0) {
                 Some(p) => p.to_string(),
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -279,7 +280,7 @@ impl Filesystem for PhotoCacheFS {
                     // Synthesize a minimal root attr
                     let now = SystemTime::now();
                     let attr = FileAttr {
-                        ino: ROOT_INO,
+                        ino: INodeNo(ROOT_INO),
                         size: 0,
                         blocks: 0,
                         atime: now,
@@ -304,7 +305,7 @@ impl Filesystem for PhotoCacheFS {
         let resolved = match self.resolve(&rel_path) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -314,24 +315,24 @@ impl Filesystem for PhotoCacheFS {
                 let attr = self.make_attr(ino, &m);
                 reply.attr(&TTL, &attr);
             }
-            Err(_) => reply.error(ENOENT),
+            Err(_) => reply.error(Errno::ENOENT),
         }
     }
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
         let rel_path = {
             let inodes = self.inodes.lock().unwrap();
-            match inodes.get_path(ino) {
+            match inodes.get_path(ino.0) {
                 Some(p) => p.to_string(),
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -340,7 +341,7 @@ impl Filesystem for PhotoCacheFS {
         let mut entries: Vec<(u64, FileType, String)> = Vec::new();
 
         // "." and ".."
-        entries.push((ino, FileType::Directory, ".".to_string()));
+        entries.push((ino.0, FileType::Directory, ".".to_string()));
         let parent_ino = if rel_path.is_empty() {
             ROOT_INO
         } else {
@@ -369,20 +370,20 @@ impl Filesystem for PhotoCacheFS {
 
         for (i, (ino, ft, name)) in entries.iter().enumerate().skip(offset as usize) {
             // reply.add returns true when buffer is full
-            if reply.add(*ino, (i + 1) as i64, *ft, &name) {
+            if reply.add(INodeNo(*ino), (i + 1) as u64, *ft, &name) {
                 break;
             }
         }
         reply.ok();
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let rel_path = {
             let inodes = self.inodes.lock().unwrap();
-            match inodes.get_path(ino) {
+            match inodes.get_path(ino.0) {
                 Some(p) => p.to_string(),
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -391,20 +392,20 @@ impl Filesystem for PhotoCacheFS {
         let resolved = match self.resolve(&rel_path) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
 
         let file = match OpenOptions::new()
             .read(true)
-            .write(flags & libc::O_WRONLY != 0 || flags & libc::O_RDWR != 0)
+            .write(flags.0 & libc::O_WRONLY != 0 || flags.0 & libc::O_RDWR != 0)
             .open(&resolved)
         {
             Ok(f) => f,
             Err(e) => {
                 error!("Failed to open {:?}: {}", resolved, e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
@@ -415,82 +416,82 @@ impl Filesystem for PhotoCacheFS {
             .unwrap()
             .insert(fh, OpenFileHandle { file });
 
-        reply.opened(fh, 0);
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
-        _ino: u64,
-        fh: u64,
-        offset: i64,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
         let mut handles = self.file_handles.lock().unwrap();
-        let handle = match handles.get_mut(&fh) {
+        let handle = match handles.get_mut(&fh.0) {
             Some(h) => h,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
 
         let mut buf = vec![0u8; size as usize];
-        if let Err(e) = handle.file.seek(SeekFrom::Start(offset as u64)) {
+        if let Err(e) = handle.file.seek(SeekFrom::Start(offset)) {
             error!("seek error: {}", e);
-            reply.error(EIO);
+            reply.error(Errno::EIO);
             return;
         }
         match handle.file.read(&mut buf) {
             Ok(n) => reply.data(&buf[..n]),
             Err(e) => {
                 error!("read error: {}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
 
     fn release(
-        &mut self,
+        &self,
         _req: &Request,
-        _ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.file_handles.lock().unwrap().remove(&fh);
+        self.file_handles.lock().unwrap().remove(&fh.0);
         reply.ok();
     }
 
     fn create(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
-        flags: i32,
+        _flags: i32,
         reply: ReplyCreate,
     ) {
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
 
         let parent_rel = {
             let inodes = self.inodes.lock().unwrap();
-            match inodes.get_path(parent) {
+            match inodes.get_path(parent.0) {
                 Some(p) => p.to_string(),
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -513,7 +514,7 @@ impl Filesystem for PhotoCacheFS {
             Ok(f) => f,
             Err(e) => {
                 error!("Failed to create on NAS {:?}: {}", nas_path, e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
@@ -544,7 +545,7 @@ impl Filesystem for PhotoCacheFS {
                 Ok(f) => f,
                 Err(e) => {
                     error!("Failed to open created file: {}", e);
-                    reply.error(EIO);
+                    reply.error(Errno::EIO);
                     return;
                 }
             },
@@ -555,41 +556,41 @@ impl Filesystem for PhotoCacheFS {
         {
             Ok(m) => m,
             Err(_) => {
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
 
         let ino = self.inodes.lock().unwrap().get_or_create(&child_rel);
-        let attr = self.make_attr(ino, &meta);
+        let attr = self.make_attr(INodeNo(ino), &meta);
         let fh = self.alloc_fh();
         self.file_handles
             .lock()
             .unwrap()
             .insert(fh, OpenFileHandle { file });
 
-        reply.created(&TTL, &attr, 0, fh, 0);
+        reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty());
     }
 
     fn write(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
         // Write-through: write to NAS, then update cache copy
         let rel_path = {
             let inodes = self.inodes.lock().unwrap();
-            match inodes.get_path(ino) {
+            match inodes.get_path(ino.0) {
                 Some(p) => p.to_string(),
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -599,7 +600,7 @@ impl Filesystem for PhotoCacheFS {
         let nas_path = self.nas_path.join(&rel_path);
         if nas_path.exists() {
             if let Ok(mut f) = OpenOptions::new().write(true).open(&nas_path) {
-                if f.seek(SeekFrom::Start(offset as u64)).is_ok() {
+                if f.seek(SeekFrom::Start(offset)).is_ok() {
                     let _ = f.write_all(data);
                 }
             }
@@ -607,32 +608,32 @@ impl Filesystem for PhotoCacheFS {
 
         // Write to cache via file handle
         let mut handles = self.file_handles.lock().unwrap();
-        let handle = match handles.get_mut(&fh) {
+        let handle = match handles.get_mut(&fh.0) {
             Some(h) => h,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
 
-        if let Err(e) = handle.file.seek(SeekFrom::Start(offset as u64)) {
+        if let Err(e) = handle.file.seek(SeekFrom::Start(offset)) {
             error!("write seek error: {}", e);
-            reply.error(EIO);
+            reply.error(Errno::EIO);
             return;
         }
         match handle.file.write(data) {
             Ok(n) => reply.written(n as u32),
             Err(e) => {
                 error!("write error: {}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
 
     fn mkdir(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
@@ -641,17 +642,17 @@ impl Filesystem for PhotoCacheFS {
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
 
         let parent_rel = {
             let inodes = self.inodes.lock().unwrap();
-            match inodes.get_path(parent) {
+            match inodes.get_path(parent.0) {
                 Some(p) => p.to_string(),
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -664,7 +665,7 @@ impl Filesystem for PhotoCacheFS {
         // Create on NAS
         if let Err(e) = fs::create_dir_all(&nas_dir) {
             error!("mkdir NAS failed {:?}: {}", nas_dir, e);
-            reply.error(EIO);
+            reply.error(Errno::EIO);
             return;
         }
 
@@ -683,31 +684,31 @@ impl Filesystem for PhotoCacheFS {
         let meta = match fs::metadata(&nas_dir) {
             Ok(m) => m,
             Err(_) => {
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
 
         let ino = self.inodes.lock().unwrap().get_or_create(&child_rel);
-        let attr = self.make_attr(ino, &meta);
-        reply.entry(&TTL, &attr, 0);
+        let attr = self.make_attr(INodeNo(ino), &meta);
+        reply.entry(&TTL, &attr, Generation(0));
     }
 
-    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
 
         let parent_rel = {
             let inodes = self.inodes.lock().unwrap();
-            match inodes.get_path(parent) {
+            match inodes.get_path(parent.0) {
                 Some(p) => p.to_string(),
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -720,7 +721,7 @@ impl Filesystem for PhotoCacheFS {
         if nas_path.exists() {
             if let Err(e) = fs::remove_file(&nas_path) {
                 error!("unlink NAS failed {:?}: {}", nas_path, e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         }
@@ -735,21 +736,21 @@ impl Filesystem for PhotoCacheFS {
         reply.ok();
     }
 
-    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
 
         let parent_rel = {
             let inodes = self.inodes.lock().unwrap();
-            match inodes.get_path(parent) {
+            match inodes.get_path(parent.0) {
                 Some(p) => p.to_string(),
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -760,7 +761,7 @@ impl Filesystem for PhotoCacheFS {
         // Check that merged directory is empty
         let children = self.list_dir(&child_rel);
         if !children.is_empty() {
-            reply.error(ENOTEMPTY);
+            reply.error(Errno::ENOTEMPTY);
             return;
         }
 
@@ -769,7 +770,7 @@ impl Filesystem for PhotoCacheFS {
         if nas_dir.exists() {
             if let Err(e) = fs::remove_dir(&nas_dir) {
                 error!("rmdir NAS failed {:?}: {}", nas_dir, e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         }
@@ -785,43 +786,43 @@ impl Filesystem for PhotoCacheFS {
     }
 
     fn rename(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &OsStr,
-        _flags: u32,
+        _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
         let newname_str = match newname.to_str() {
             Some(n) => n,
             None => {
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
 
         let (parent_rel, newparent_rel) = {
             let inodes = self.inodes.lock().unwrap();
-            let p = match inodes.get_path(parent) {
+            let p = match inodes.get_path(parent.0) {
                 Some(p) => p.to_string(),
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             };
-            let np = match inodes.get_path(newparent) {
+            let np = match inodes.get_path(newparent.0) {
                 Some(p) => p.to_string(),
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             };
@@ -840,7 +841,7 @@ impl Filesystem for PhotoCacheFS {
             }
             if let Err(e) = fs::rename(&old_nas, &new_nas) {
                 error!("rename NAS failed: {}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         }
@@ -860,9 +861,9 @@ impl Filesystem for PhotoCacheFS {
     }
 
     fn setattr(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
+        ino: INodeNo,
         mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
@@ -870,19 +871,19 @@ impl Filesystem for PhotoCacheFS {
         _atime: Option<TimeOrNow>,
         _mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
+        _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
         let rel_path = {
             let inodes = self.inodes.lock().unwrap();
-            match inodes.get_path(ino) {
+            match inodes.get_path(ino.0) {
                 Some(p) => p.to_string(),
                 None => {
-                    reply.error(ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -891,7 +892,7 @@ impl Filesystem for PhotoCacheFS {
         let resolved = match self.resolve(&rel_path) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         };
@@ -924,11 +925,11 @@ impl Filesystem for PhotoCacheFS {
                 let attr = self.make_attr(ino, &m);
                 reply.attr(&TTL, &attr);
             }
-            Err(_) => reply.error(EIO),
+            Err(_) => reply.error(Errno::EIO),
         }
     }
 
-    fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         // Report stats based on the NAS path filesystem
         // Use a reasonable default
         reply.statfs(
@@ -949,11 +950,12 @@ pub fn mount(nas_path: PathBuf, cache_dir: PathBuf, mount_point: &Path) {
     fs::create_dir_all(mount_point).ok();
     fs::create_dir_all(&cache_dir).ok();
     let filesystem = PhotoCacheFS::new(nas_path, cache_dir);
-    let options = vec![
+    let mut config = Config::default();
+    config.mount_options = vec![
         MountOption::FSName("photocache".to_string()),
         MountOption::AutoUnmount,
     ];
-    fuser::mount2(filesystem, mount_point, &options).unwrap();
+    fuser::mount2(filesystem, mount_point, &config).unwrap();
 }
 
 #[cfg(test)]
