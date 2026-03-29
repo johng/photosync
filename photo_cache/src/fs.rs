@@ -117,6 +117,8 @@ pub struct PhotoCacheFS {
     flush_worker: Option<WriteFlushWorker>,
     /// In-memory set of fully cached directory names for fast lookups.
     cached_dirs: Mutex<HashSet<String>>,
+    /// Directories known to have no photos (avoid repeated cache attempts).
+    empty_dirs: Mutex<HashSet<String>>,
     /// In-memory set of files pending NAS write.
     pending_writes: Mutex<HashSet<String>>,
     uid: u32,
@@ -160,6 +162,7 @@ impl PhotoCacheFS {
             cache_worker,
             flush_worker,
             cached_dirs: Mutex::new(initial_dirs),
+            empty_dirs: Mutex::new(HashSet::new()),
             pending_writes: Mutex::new(initial_pending),
             uid,
             gid,
@@ -198,17 +201,20 @@ impl PhotoCacheFS {
         false
     }
 
-    /// Extract the top-level directory from a relative path (e.g., "March 2026/IMG.jpg" -> "March 2026")
+    /// Extract the parent directory from a relative path (e.g., "March 2026/IMG.jpg" -> "March 2026", "2024/January/DSC.jpg" -> "2024/January")
     fn parent_dir(rel_path: &str) -> Option<&str> {
-        rel_path.split('/').next().filter(|s| !s.is_empty() && rel_path.contains('/'))
+        rel_path.rfind('/').map(|pos| &rel_path[..pos]).filter(|s| !s.is_empty())
     }
 
     /// Trigger background caching of the directory containing this file.
     fn trigger_dir_cache(&self, rel_path: &str) {
-        // Drain completed cache operations and flushed writes
+        // Drain completed cache operations, empty dirs, and flushed writes
         if let Some(ref worker) = self.cache_worker {
             for dir in worker.drain_completed() {
                 self.cached_dirs.lock().unwrap().insert(dir);
+            }
+            for dir in worker.drain_empty() {
+                self.empty_dirs.lock().unwrap().insert(dir);
             }
         }
         if let Some(ref flush) = self.flush_worker {
@@ -223,13 +229,14 @@ impl PhotoCacheFS {
 
         if let Some(dir) = Self::parent_dir(rel_path) {
             let already_cached = self.cached_dirs.lock().unwrap().contains(dir);
+            let is_empty = self.empty_dirs.lock().unwrap().contains(dir);
             if already_cached {
                 // Touch the dir to update LRU
                 if let Some(ref db) = self.db {
                     let db = db.lock().unwrap();
                     let _ = db.touch_dir_access(dir);
                 }
-            } else {
+            } else if !is_empty {
                 debug!("Requesting cache for directory: {}", dir);
                 if let Some(ref worker) = self.cache_worker {
                     worker.request_cache(dir.to_string());
@@ -343,7 +350,7 @@ impl PhotoCacheFS {
     /// List children of a directory by merging NAS + cache entries.
     /// Names to hide from directory listings (Synology metadata, macOS resource forks).
     fn is_hidden_entry(name: &str) -> bool {
-        name == "@eaDir" || name.starts_with("._") || name.contains("@Syno")
+        name == "@eaDir" || name == ".DS_Store" || name.starts_with("._") || name.contains("@Syno")
     }
 
     fn list_dir(&self, rel_path: &str) -> Vec<(String, FileType)> {
@@ -1321,6 +1328,7 @@ pub fn mount(
             cache_dir.clone(),
             Arc::new(Mutex::new(flush_db)),
             std::time::Duration::from_secs(5),
+            max_cache_bytes,
         )
     };
 
@@ -1600,8 +1608,8 @@ mod tests {
 
     #[test]
     fn test_parent_dir_nested() {
-        // Returns only the first component
-        assert_eq!(PhotoCacheFS::parent_dir("a/b/c"), Some("a"));
+        // Returns the immediate parent directory
+        assert_eq!(PhotoCacheFS::parent_dir("a/b/c"), Some("a/b"));
     }
 
     // --- make_finder_info tests ---
@@ -1623,14 +1631,14 @@ mod tests {
     fn test_make_finder_info_yellow() {
         let info = make_finder_info(FINDER_COLOR_YELLOW);
         assert_eq!(info[9], FINDER_COLOR_YELLOW);
-        assert_eq!(info[9], 0x06);
+        assert_eq!(info[9], 0x0A);
     }
 
     #[test]
     fn test_make_finder_info_orange() {
         let info = make_finder_info(FINDER_COLOR_ORANGE);
         assert_eq!(info[9], FINDER_COLOR_ORANGE);
-        assert_eq!(info[9], 0x02);
+        assert_eq!(info[9], 0x0E);
     }
 
     #[test]

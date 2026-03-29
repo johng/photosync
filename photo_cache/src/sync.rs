@@ -18,7 +18,7 @@ const PHOTO_EXTENSIONS: &[&str] = &[
 fn is_photo(path: &Path) -> bool {
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
         // Skip macOS resource fork / AppleDouble files
-        if name.starts_with("._") {
+        if name.starts_with("._") || name == ".DS_Store" {
             return false;
         }
         // Skip Synology metadata
@@ -114,8 +114,10 @@ pub fn cache_directory(
         db.add(&file.rel_path, file.size, file.mtime).ok();
     }
 
-    // Only mark directory as fully cached if all files succeeded
-    if failed {
+    // Only mark directory as fully cached if there were photos and all succeeded
+    if cached_count == 0 && skipped_count == 0 {
+        debug!("Directory has no photos to cache: {}", dir_rel);
+    } else if failed {
         warn!(
             "Directory partially cached: {} — {} files cached, {} skipped, some failed",
             dir_rel, cached_count, skipped_count
@@ -287,6 +289,8 @@ pub struct CacheWorker {
     tx: mpsc::Sender<String>,
     /// Receive directory names that have been fully cached.
     completed_rx: Mutex<mpsc::Receiver<String>>,
+    /// Receive directory names found to have no photos.
+    empty_rx: Mutex<mpsc::Receiver<String>>,
 }
 
 impl CacheWorker {
@@ -299,6 +303,7 @@ impl CacheWorker {
     ) -> Self {
         let (tx, rx) = mpsc::channel::<String>();
         let (completed_tx, completed_rx) = mpsc::channel::<String>();
+        let (empty_tx, empty_rx) = mpsc::channel::<String>();
 
         thread::spawn(move || {
             // Clean up any partial caches from previous interrupted runs
@@ -315,9 +320,11 @@ impl CacheWorker {
                 // Cache the directory
                 cache_directory(&nas_path, &cache_dir, &dir_rel, &db_guard);
 
-                // Notify that this dir is now cached (if it was marked in DB)
+                // Notify: either cached successfully or empty (no photos)
                 if db_guard.is_dir_cached(&dir_rel).unwrap_or(false) {
                     let _ = completed_tx.send(dir_rel.clone());
+                } else {
+                    let _ = empty_tx.send(dir_rel.clone());
                 }
 
                 // Evict LRU dirs if over budget (protect the one we just cached)
@@ -329,6 +336,7 @@ impl CacheWorker {
         CacheWorker {
             tx,
             completed_rx: Mutex::new(completed_rx),
+            empty_rx: Mutex::new(empty_rx),
         }
     }
 
@@ -340,6 +348,16 @@ impl CacheWorker {
     /// Drain any directories that have finished caching since the last call.
     pub fn drain_completed(&self) -> Vec<String> {
         let rx = self.completed_rx.lock().unwrap();
+        let mut dirs = Vec::new();
+        while let Ok(dir) = rx.try_recv() {
+            dirs.push(dir);
+        }
+        dirs
+    }
+
+    /// Drain directories found to have no photos.
+    pub fn drain_empty(&self) -> Vec<String> {
+        let rx = self.empty_rx.lock().unwrap();
         let mut dirs = Vec::new();
         while let Ok(dir) = rx.try_recv() {
             dirs.push(dir);
@@ -360,6 +378,7 @@ impl WriteFlushWorker {
         cache_dir: PathBuf,
         db: Arc<Mutex<CacheDB>>,
         flush_interval: Duration,
+        max_cache_bytes: u64,
     ) -> Self {
         let (flushed_tx, flushed_rx) = mpsc::channel::<String>();
 
@@ -405,6 +424,12 @@ impl WriteFlushWorker {
                             warn!("Failed to flush to NAS {}: {} (will retry)", rel_path, e);
                         }
                     }
+                }
+
+                // After flushing, check if cache is over budget and evict if needed
+                {
+                    let db_guard = db.lock().unwrap();
+                    evict_lru(&cache_dir, &db_guard, max_cache_bytes, None);
                 }
             }
         });
@@ -682,6 +707,7 @@ mod tests {
             cache.path().to_path_buf(),
             db.clone(),
             Duration::from_millis(50),
+            u64::MAX, // no eviction limit in test
         );
 
         // Wait for flush to happen
