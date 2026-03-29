@@ -1,57 +1,48 @@
 # photocache
 
-A FUSE filesystem that presents a unified view of your NAS photos with on-demand local caching. Open a photo and its entire directory gets cached locally for instant access. Least-recently-used directories are evicted when the cache is full.
+Browse your entire NAS photo library as if it were local. No waiting, no manual syncing, no duplicates.
 
-## How it works
+photocache is a FUSE filesystem for macOS that mounts your NAS photos as a regular folder. Photos you actually look at get cached locally for instant access. Everything else streams transparently from the NAS. Write a photo and it saves to your local disk immediately, then syncs to the NAS in the background within seconds.
 
-- Mounts a virtual directory (e.g. `~/NAS Pictures`) showing **all** NAS photos
-- **On-demand caching**: opening any photo triggers caching of its entire directory
-- **LRU eviction**: least-recently-accessed directories are evicted when cache exceeds the limit
-- **Write-local-first**: new photos are written to local cache instantly, then flushed to NAS in the background (every 5 seconds)
-- **Finder tags**: green dot = cached, orange dot = pending NAS write, no dot = NAS-only
-- **NAS change detection**: directories moved/deleted on the NAS are detected and cache invalidated within 60 seconds
-- Synology metadata (`@eaDir`), macOS resource forks (`._*`), and `.DS_Store` files are hidden
+**Why?** NAS photo libraries are slow to browse. Cloud sync tools copy everything. photocache gives you the speed of local storage with the capacity of your NAS, using only the disk space you choose.
 
-## Prerequisites
+## Features
 
-macFUSE is required:
+- **On-demand caching** -- open a photo and its entire directory gets cached locally
+- **LRU eviction** -- least-recently-used directories are automatically evicted when the cache is full
+- **Write-local-first** -- new and edited photos save instantly to cache, then flush to NAS in the background
+- **Finder integration** -- green dot for cached files, orange dot for pending NAS sync
+- **NAS change detection** -- files moved or deleted on the NAS are detected and cache updated within 60 seconds
+- **Crash-safe** -- partial caches from interrupted sessions are cleaned up on next mount
+- **Clean browsing** -- Synology metadata, macOS resource forks, and `.DS_Store` files are hidden
+
+## Quick start
 
 ```bash
+# Prerequisites: macFUSE
 brew install macfuse
-# Allow the kernel extension in System Settings > Privacy & Security
-# Reboot
-```
+# Allow kernel extension in System Settings > Privacy & Security, then reboot
 
-## Install
-
-```bash
+# Install
 make install
-```
 
-This builds the release binary, copies it to `/usr/local/bin/`, and initializes the config.
-
-## Setup
-
-```bash
-# 1. Mount your NAS (if not already)
-sudo mount -v -t nfs -o vers=3,nolock,resvport 192.168.50.21:/volume1/media /Users/johng/nas_media
-
-# 2. Mount the virtual filesystem
+# Mount your NAS and start browsing
+sudo mount -t nfs -o vers=3,nolock,resvport 192.168.50.21:/volume1/media ~/nas_media
 photocache mount
 ```
 
-Directories are cached automatically as you browse and open photos.
+Open `~/NAS Pictures` in Finder. Directories cache automatically as you browse.
 
 ## Make targets
 
 | Target | Description |
 |--------|-------------|
-| `make build` | Build release binary |
 | `make install` | Build, install to `/usr/local/bin`, init config |
-| `make uninstall` | Stop service, remove binary and plist |
-| `make service-start` | Install and start launchd service |
-| `make service-stop` | Stop and remove launchd service |
-| `make service-restart` | Restart launchd service |
+| `make upgrade` | Rebuild and replace binary, restart service |
+| `make uninstall` | Stop service, remove binary |
+| `make service-start` | Start as a background launchd service |
+| `make service-stop` | Stop the background service |
+| `make service-restart` | Restart the service |
 | `make test` | Run tests |
 | `make clean` | Remove build artifacts |
 
@@ -59,15 +50,15 @@ Directories are cached automatically as you browse and open photos.
 
 | Command | Description |
 |---------|-------------|
-| `photocache init` | Create config file and cache directories |
-| `photocache status` | Show cache usage, cached/partial directories, pending writes |
 | `photocache mount` | Mount the FUSE filesystem |
 | `photocache unmount` | Unmount the filesystem |
-| `photocache clear` | Wipe the local cache (must unmount first) |
+| `photocache status` | Show cache usage, cached directories, pending writes |
+| `photocache init` | Create config file and cache directories |
+| `photocache clear` | Wipe the local cache (unmount first) |
 
 ## Configuration
 
-Config lives at `~/.photo_cache/config.json`:
+Config is created at `~/.photo_cache/config.json` on first `init`:
 
 ```json
 {
@@ -79,61 +70,56 @@ Config lives at `~/.photo_cache/config.json`:
 }
 ```
 
-- `max_cache_bytes` — Local cache size limit (default: 50GB)
+`max_cache_bytes` controls the local cache size limit (default 50 GB).
 
-## Run as a background service
+## Background service
 
-```bash
-make service-start
-```
-
-To stop:
+Run photocache automatically at login:
 
 ```bash
-make service-stop
+make service-start    # install and start
+make service-stop     # stop
+make service-restart  # restart after config changes
 ```
 
 ## Logging
 
 ```bash
-# Cache operations only (recommended)
+# Recommended: cache operations
 RUST_LOG=photocache::sync=info photocache mount
 
-# Per-file detail
+# Verbose: per-file detail
 RUST_LOG=photocache::sync=debug photocache mount
-
-# All modules
-RUST_LOG=photocache=debug photocache mount
 ```
 
-When running as a launchd service, logs go to:
-- `~/Library/Logs/photocache/mount.log`
-- `~/Library/Logs/photocache/mount.err.log`
+Service logs: `~/Library/Logs/photocache/`
 
-## Architecture
+## How it works
 
 ```
 ~/NAS Pictures (FUSE mount)
-    |
-    +-- Read --> Check local cache --> HIT: serve from disk
-    |                              +-> MISS: read from NAS
-    |
-    +-- Write --> Write to local cache --> Background flush to NAS (every 5s)
-    |
-    +-- Directory listing --> Merge NAS + cache entries (sorted, deduped)
-    |
-    +-- Finder tags --> Green: cached, Orange: pending NAS write
 
-Background workers:
-    Cache worker: caches directories on demand, evicts LRU when over budget
-    Flush worker: syncs pending writes to NAS, runs eviction, validates NAS state
+  Reads:    cache hit  --> local disk (fast)
+            cache miss --> NAS (transparent)
 
-Startup cleanup:
-    - Removes partial caches from interrupted sessions
-    - Removes cached files deleted from NAS (preserves pending writes)
-    - Cleans stale DB entries
+  Writes:   local cache --> background flush to NAS (5s)
+
+  Browsing: merged NAS + cache directory listings
+
+  Tags:     green = cached    orange = pending sync
+
+Background:
+  Cache worker   -- caches directories on demand, evicts LRU
+  Flush worker   -- syncs writes to NAS, validates NAS state
+  Startup        -- cleans partial caches, removes stale entries
 ```
 
 ## Supported formats
 
 jpg, jpeg, png, heic, heif, dng, raw, tiff, tif, cr2, nef, arw, aae, xmp, mov
+
+## Requirements
+
+- macOS with [macFUSE](https://macfuse.github.io/)
+- NAS accessible via NFS mount
+- Rust toolchain (for building)
