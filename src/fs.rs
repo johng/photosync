@@ -363,8 +363,8 @@ impl PhotoCacheFS {
 
     /// Temp files that should not be tracked as pending NAS writes.
     fn is_temp_file(name: &str) -> bool {
-        name.ends_with(".swp") || name.ends_with(".tmp") || name.ends_with("~")
-            || name.starts_with(".~") || name.starts_with("~$")
+        name == ".DS_Store" || name.ends_with(".swp") || name.ends_with(".tmp")
+            || name.ends_with("~") || name.starts_with(".~") || name.starts_with("~$")
     }
 
     fn list_dir(&self, rel_path: &str) -> Vec<(String, FileType)> {
