@@ -8,7 +8,6 @@ pub struct Config {
     pub db_path: PathBuf,
     pub mount_point: PathBuf,
     pub max_cache_bytes: u64,
-    pub sync_interval_minutes: u64,
 }
 
 impl Default for Config {
@@ -20,7 +19,6 @@ impl Default for Config {
             db_path: home.join(".photo_cache/cache.db"),
             mount_point: home.join("Photos"),
             max_cache_bytes: 53_687_091_200, // 50 GB
-            sync_interval_minutes: 30,
         }
     }
 }
@@ -47,9 +45,6 @@ impl Config {
                         if let Some(v) = obj.get("max_cache_bytes").and_then(|v| v.as_u64()) {
                             config.max_cache_bytes = v;
                         }
-                        if let Some(v) = obj.get("sync_interval_minutes").and_then(|v| v.as_u64()) {
-                            config.sync_interval_minutes = v;
-                        }
                     }
                 }
             }
@@ -68,7 +63,6 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.max_cache_bytes, 53_687_091_200);
-        assert_eq!(config.sync_interval_minutes, 30);
     }
 
     #[test]
@@ -83,6 +77,5 @@ mod tests {
         write!(f, r#"{{"max_cache_bytes": 1000}}"#).unwrap();
         let config = Config::load(f.path());
         assert_eq!(config.max_cache_bytes, 1000);
-        assert_eq!(config.sync_interval_minutes, 30);
     }
 }

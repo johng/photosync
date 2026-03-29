@@ -3,6 +3,7 @@ use rusqlite::{Connection, params};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[allow(dead_code)]
 pub struct CacheEntry {
     pub path: String,
     pub size: u64,
@@ -10,6 +11,7 @@ pub struct CacheEntry {
     pub cached_at: f64,
 }
 
+#[allow(dead_code)]
 pub struct DirEntry {
     pub dir_path: String,
     pub total_size: u64,

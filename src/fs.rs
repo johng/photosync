@@ -20,14 +20,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(30);
 const ROOT_INO: u64 = 1;
-const FINDER_TAGS_XATTR: &str = "com.apple.metadata:_kMDItemUserTags";
 const FINDER_INFO_XATTR: &str = "com.apple.FinderInfo";
 const FINDER_INFO_LEN: usize = 32;
 
 // FinderInfo color label values for byte 9: color << 1 (bits 3:1)
 // Verified mapping: 1=gray, 2=green, 3=purple, 4=blue, 5=yellow, 6=red, 7=orange
 const FINDER_COLOR_GREEN: u8 = 2 << 1;  // 0x04
-const FINDER_COLOR_YELLOW: u8 = 5 << 1; // 0x0A
 const FINDER_COLOR_ORANGE: u8 = 7 << 1; // 0x0E
 
 fn make_finder_info(color_byte: u8) -> [u8; FINDER_INFO_LEN] {
@@ -35,22 +33,6 @@ fn make_finder_info(color_byte: u8) -> [u8; FINDER_INFO_LEN] {
     info[9] = color_byte;
     info
 }
-
-
-// Binary plist encoding of ["Green\n2"] — file cached locally
-// Tag color indices: 0=none, 1=gray, 2=green, 3=purple, 4=blue, 5=yellow, 6=red, 7=orange
-const GREEN_TAG_PLIST: &[u8] = &[
-    98, 112, 108, 105, 115, 116, 48, 48, 161, 1, 87, 71, 114, 101, 101, 110, 10, 50,
-    8, 10, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 18,
-];
-
-// Binary plist encoding of ["Orange\n7"] — pending NAS write tag
-const ORANGE_TAG_PLIST: &[u8] = &[
-    98, 112, 108, 105, 115, 116, 48, 48, 161, 1, 88, 79, 114, 97, 110, 103, 101, 10,
-    55, 8, 10, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 19,
-];
 
 struct InodeMap {
     path_to_ino: HashMap<String, u64>,
@@ -866,7 +848,7 @@ impl Filesystem for PhotoCacheFS {
     fn write(
         &self,
         _req: &Request,
-        ino: INodeNo,
+        _ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         data: &[u8],
@@ -1712,8 +1694,7 @@ mod tests {
 
     #[test]
     fn test_make_finder_info_yellow() {
-        let info = make_finder_info(FINDER_COLOR_YELLOW);
-        assert_eq!(info[9], FINDER_COLOR_YELLOW);
+        let info = make_finder_info(5 << 1); // yellow
         assert_eq!(info[9], 0x0A);
     }
 

@@ -118,6 +118,25 @@ Background:
 
 jpg, jpeg, png, heic, heif, dng, raw, tiff, tif, cr2, nef, arw, aae, xmp, mov
 
+## Why not rclone mount?
+
+[rclone mount](https://rclone.org/commands/rclone_mount/) is an excellent tool for mounting cloud storage (S3, Google Drive, Dropbox) as a local folder. Its VFS cache makes remote files work with local apps. But it solves a different problem:
+
+**rclone** connects to cloud APIs (HTTP) where random reads aren't possible, so it downloads files to a local cache to make `seek`/`read` work at all. The cache exists for *correctness*, not speed. Each file is cached individually as accessed.
+
+**photocache** sits on top of an existing NFS mount where reads already work. The cache exists purely for *speed*. When you open one photo, the entire directory is pre-fetched in the background so the next photo is instant. This matches how people actually browse photos — flipping through a folder, not jumping between random files.
+
+| | photocache | rclone mount |
+|---|---|---|
+| Backend | NFS mount (already works) | Cloud APIs (S3, SFTP, WebDAV) |
+| Cache purpose | Speed (prefetch for browsing) | Correctness (make seeks work) |
+| Cache unit | Entire directory on first access | Individual files as accessed |
+| Browse 100 photos | 1 network fetch (directory) | 100 network fetches (each file) |
+| Finder tags | Green/orange cache indicators | No |
+| Write model | Local-first, async flush | Write-through or full cache |
+
+Use rclone if your photos are in cloud storage. Use photocache if they're on a NAS.
+
 ## Requirements
 
 - macOS with [macFUSE](https://macfuse.github.io/)
