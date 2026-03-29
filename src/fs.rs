@@ -359,6 +359,12 @@ impl PhotoCacheFS {
         name == "@eaDir" || name == ".DS_Store" || name.starts_with("._") || name.contains("@Syno")
     }
 
+    /// Temp files that should not be tracked as pending NAS writes.
+    fn is_temp_file(name: &str) -> bool {
+        name.ends_with(".swp") || name.ends_with(".tmp") || name.ends_with("~")
+            || name.starts_with(".~") || name.starts_with("~$")
+    }
+
     fn list_dir(&self, rel_path: &str) -> Vec<(String, FileType)> {
         let mut entries: HashMap<String, FileType> = HashMap::new();
 
@@ -792,11 +798,17 @@ impl Filesystem for PhotoCacheFS {
             fs::set_permissions(&cache_path, perms).ok();
         }
 
-        // Mark as pending NAS write
-        self.pending_writes.lock().unwrap().insert(child_rel.clone());
-        if let Some(ref db) = self.db {
-            let db = db.lock().unwrap();
-            db.add_pending_write(&child_rel).ok();
+        // Mark as pending NAS write (skip temp files)
+        let file_name = std::path::Path::new(&child_rel)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if !Self::is_temp_file(file_name) {
+            self.pending_writes.lock().unwrap().insert(child_rel.clone());
+            if let Some(ref db) = self.db {
+                let db = db.lock().unwrap();
+                db.add_pending_write(&child_rel).ok();
+            }
         }
 
         // Open the cache copy for subsequent read/write
